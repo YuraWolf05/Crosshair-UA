@@ -1,0 +1,573 @@
+import sys
+import json
+import os
+import ctypes
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt
+import keyboard  # global hotkey library
+import resources_rc
+
+# Windows constants
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOPMOST = 0x00000008
+
+user32 = ctypes.windll.user32
+GetAsyncKeyState = user32.GetAsyncKeyState
+
+SETTINGS_FILE = "settings.json"
+
+# VK code for right mouse button
+VK_RBUTTON = 0x02
+
+
+def save_settings_to_file(settings):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(settings, f, indent=4)
+    except Exception:
+        pass
+
+
+class OverlayWindow(QtWidgets.QWidget):
+    def __init__(self, settings):
+        super().__init__()
+        self.settings = settings
+
+        # стани
+        self.active = True
+        self.rmb_toggle_enabled = self.settings.get("rmb_toggle", False )
+        self.rmb_pressed = False
+        self.hide_on_center = self.settings.get("hide_on_center", True )
+        self.should_draw = True
+
+        # віконні прапори
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        # робимо overlay неклікабельним і прибираємо курсор
+        hwnd = int(self.winId())
+        ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ctypes.windll.user32.SetWindowLongW(
+            hwnd,
+            GWL_EXSTYLE,
+            ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+        )
+        self.setCursor(Qt.BlankCursor)
+
+        # overlay на весь екран
+        screen_geo = QtWidgets.QApplication.primaryScreen().geometry()
+        self.setGeometry(screen_geo)
+        self.setWindowTitle("ReticleX Overlay")
+        self.show()
+
+        # таймер
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_overlay)
+        self.timer.start(10)
+
+    def update_overlay(self):
+        # стан правої кнопки
+        rmb_state = bool(GetAsyncKeyState(VK_RBUTTON) & 0x8000)
+        self.rmb_pressed = rmb_state
+
+        # логіка
+        if self.hide_on_center and self._cursor_is_centered():
+            self.should_draw = False
+        elif self.rmb_toggle_enabled and self.rmb_pressed:
+            self.should_draw = False
+        else:
+            self.should_draw = self.active
+
+        self.update()
+
+    def toggle_active(self):
+        self.active = not self.active
+        self.update_overlay()
+
+    def _cursor_is_centered(self):
+        pos = QtGui.QCursor.pos()
+        geo = self.geometry()
+        cx, cy = geo.center().x(), geo.center().y()
+        return abs(pos.x() - cx) < 2 and abs(pos.y() - cy) < 2
+
+    def paintEvent(self, event):
+        if not self.should_draw:
+            return
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        color_item = self.settings.get('color', (0, 255, 0))
+        if isinstance(color_item, list):
+            color_item = tuple(color_item)
+        color = QtGui.QColor(*color_item)
+        painter.setOpacity(self.settings.get('opacity', 0.9))
+        pen = QtGui.QPen(color)
+        pen.setWidth(self.settings.get('thickness', 3))
+        painter.setPen(pen)
+
+        cx = self.width() // 2
+        cy = self.height() // 2
+        size = self.settings.get('size', 30)
+        gap = self.settings.get('gap', 4)
+        style = self.settings.get('style', 'classic')
+
+        if style == 'classic':
+            painter.drawLine(cx - size - gap, cy, cx - gap, cy)
+            painter.drawLine(cx + gap, cy, cx + size + gap, cy)
+            painter.drawLine(cx, cy - size - gap, cx, cy - gap)
+            painter.drawLine(cx, cy + gap, cx, cy + size + gap)
+            if self.settings.get('center_dot', True):
+                dot_r = max(1, self.settings.get('thickness', 3))
+                painter.drawEllipse(QtCore.QPoint(cx, cy), dot_r, dot_r)
+        elif style == 'dot':
+            dot_r = max(1, size // 4)
+            painter.drawEllipse(QtCore.QPoint(cx, cy), dot_r, dot_r)
+        elif style == 'circle':
+            painter.drawEllipse(QtCore.QPoint(cx, cy), size, size)
+        elif style == 'cross+dot':
+            painter.drawLine(cx - size - gap, cy, cx - gap, cy)
+            painter.drawLine(cx + gap, cy, cx + size + gap, cy)
+            painter.drawLine(cx, cy - size - gap, cx, cy - gap)
+            painter.drawLine(cx, cy + gap, cx, cy + size + gap)
+            painter.drawEllipse(QtCore.QPoint(cx, cy),
+                                max(1, self.settings.get('thickness', 3)),
+                                max(1, self.settings.get('thickness', 3)))
+        elif style == 'plus-circle':
+            painter.drawLine(cx - size, cy, cx + size, cy)
+            painter.drawLine(cx, cy - size, cx, cy + size)
+            painter.drawEllipse(QtCore.QPoint(cx, cy), size, size)
+        else:
+            painter.drawLine(cx - size - gap, cy, cx - gap, cy)
+            painter.drawLine(cx + gap, cy, cx + size + gap, cy)
+            painter.drawLine(cx, cy - size - gap, cx, cy - gap)
+            painter.drawLine(cx, cy + gap, cx, cy + size + gap)
+
+        painter.end()
+
+
+# --- Settings Window ---
+class SettingsWindow(QtWidgets.QWidget):
+    def __init__(self, overlay: OverlayWindow, settings):
+        super().__init__()
+        self.overlay = overlay
+        self.settings = settings
+        self.setWindowTitle("ReticleX UA")
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QtWidgets.QVBoxLayout()
+
+        info_icon = QtWidgets.QLabel("Info ⚠")
+        info_icon.setStyleSheet("""
+    QLabel {
+        color: orange;
+        font-weight: bold;
+        font-size: 18px;
+        background-color: #222;
+        padding: 4px;
+        border-radius: 8px;
+        font-family: Segoe UI;
+    }
+    QLabel:hover {
+        background-color: #666;
+    }
+    QToolTip {
+        color: white;
+        font-weight: bold;
+        font-size: 20px;
+        background-color: #222;
+        border: 1px solid #666;
+        padding: 8px;
+        border-radius: 8px;
+        font-family: Segoe UI;
+    }
+""")
+
+        info_icon.setAlignment(Qt.AlignCenter)
+
+        # текст-підказка
+        info_icon.setToolTip(
+    "⚠ Приціл не відображається у режимі \"Exclusive Fullscreen - Ексклюзивний повноекранний режим\".\n"
+    "Будь ласка, використовуйте \"Borderless Windowed - Безрамковий віконний \"."
+)
+
+        layout.addWidget(info_icon, alignment=Qt.AlignRight)
+
+        color_btn = QtWidgets.QPushButton("Вибрати колір")
+        color_btn.clicked.connect(self.pick_color)
+        color_btn.setStyleSheet("""
+             QPushButton {
+                background-color: #444; 
+                color: white;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 8px 12px;
+             }
+            QPushButton:hover {
+                background-color: #2a2a2a;
+                border: 2px solid #00cc66;
+             }
+            QPushButton:pressed {
+                background-color: #222;
+             }
+            """)
+        layout.addWidget(color_btn)
+        self.size_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.size_slider.setRange(1, 100)
+        self.size_slider.setValue(self.settings.get('size', 10))
+        self.size_slider.valueChanged.connect(self.change_size)
+        layout.addWidget(QtWidgets.QLabel("Розмір лінії"))
+        layout.addWidget(self.size_slider)
+
+        self.gap_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.gap_slider.setRange(0, 100)
+        self.gap_slider.setValue(self.settings.get('gap', 2))
+        self.gap_slider.valueChanged.connect(self.change_gap)
+        layout.addWidget(QtWidgets.QLabel("Порожнина (gap)"))
+        layout.addWidget(self.gap_slider)
+
+        self.thick_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.thick_slider.setRange(1, 15)
+        self.thick_slider.setValue(self.settings.get('thickness', 1))
+        self.thick_slider.valueChanged.connect(self.change_thickness)
+        layout.addWidget(QtWidgets.QLabel("Товщина"))
+        layout.addWidget(self.thick_slider)
+
+        self.opacity_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(10, 255)
+        self.opacity_slider.setValue(int(self.settings.get('opacity', 0.9) * 255))
+        self.opacity_slider.valueChanged.connect(self.change_opacity)
+        layout.addWidget(QtWidgets.QLabel("Прозорість"))
+        layout.addWidget(self.opacity_slider)
+
+        self.style_combo = QtWidgets.QComboBox()
+        self.style_combo.addItems(['classic', 'dot', 'circle', 'cross+dot', 'plus-circle'])
+        self.style_combo.setCurrentText(self.settings.get('style', 'classic'))
+        self.style_combo.currentTextChanged.connect(self.change_style)
+
+#  стиль для QComboBox
+        self.style_combo.setStyleSheet("""
+    QComboBox {
+        background-color: #444;
+        color: white;
+        border: 1px solid #666;
+        border-radius: 8px;
+        padding: 8px;
+    }
+    QComboBox:hover {
+        background-color: #2a2a2a;
+        border: 2px solid #00cc66;
+        }
+    QComboBox::drop-down {
+        width: 5px;
+        border-left: 0px solid #666;
+        border-radius: 8px;
+        }
+    QComboBox QAbstractItemView {
+        background-color: #333;
+        selection-background-color: #555;
+        color: white;
+        border: 2px solid #00cc66;
+        border-radius: 8px;
+    }
+""")
+        
+
+        layout.addWidget(QtWidgets.QLabel("Стиль прицілу"))
+        layout.addWidget(self.style_combo)
+
+
+        checkbox_style = """
+    QCheckBox {
+        color: white;
+        font-weight: bold;
+        font-size: 14px;
+    }
+
+    QCheckBox::indicator {
+        width: 20px;
+        height: 20px;
+        border-radius: 4px;
+        border: 2px solid #888;
+        background-color: #222;
+    }
+
+    QCheckBox::indicator:checked {
+        image: url(:/icons/checkmark.png);   /* ✅ правильна іконка */
+        border: 2px solid #00cc66;
+        background-color: #111;
+    }
+
+    QCheckBox::indicator:unchecked {
+        image: url(:/icons/uncheck.png);     /* ❌ щоб було видно порожній квадратик */
+        border: 2px solid #888;
+        background-color: #333;
+    }
+
+    QCheckBox::indicator:hover {
+        background-color: #2a2a2a;
+        border: 2px solid #f5020f;
+    }
+"""
+
+
+        self.center_dot_cb = QtWidgets.QCheckBox("Центральна точка")
+        self.center_dot_cb.setStyleSheet(checkbox_style)
+        self.center_dot_cb.setChecked(self.settings.get('center_dot', True))
+        self.center_dot_cb.stateChanged.connect(self.toggle_center_dot)
+        layout.addWidget(self.center_dot_cb)
+
+        self.rmb_toggle_cb = QtWidgets.QCheckBox("Заховати приціл при ПКМ")
+        self.rmb_toggle_cb.setStyleSheet(checkbox_style)
+        self.rmb_toggle_cb.setChecked(self.settings.get("rmb_toggle", False))
+        self.rmb_toggle_cb.stateChanged.connect(self.toggle_rmb)
+        layout.addWidget(self.rmb_toggle_cb)
+
+
+        label = QtWidgets.QLabel("Гаряча клавіша для показу/ховання:")
+        label.setStyleSheet("""
+    QLabel {
+        font-size: 18px;
+    }
+""")
+        layout.addWidget(label)
+
+        self.hotkey_edit = QtWidgets.QLineEdit()
+        self.hotkey_edit.setText(self.settings.get('hotkey', 'f12'))
+        self.hotkey_edit.setFixedWidth(120)  # можна піджати поле, щоб було акуратно
+        self.hotkey_edit.setAlignment(Qt.AlignCenter)
+
+        self.hotkey_edit.setStyleSheet("""
+    QLineEdit {
+        background-color: #444; 
+        color: #fff;
+        font-weight: bold;
+        font-size: 14px;
+        padding: 6px 10px;
+        border-radius: 8px;
+        border: 1px solid #888;
+    }
+    QLineEdit:hover {
+        background-color: #2a2a2a;
+        border: 2px solid #00cc66;
+        }
+""")
+        layout.addWidget(self.hotkey_edit)
+
+        save_btn = QtWidgets.QPushButton("Зберегти налаштування")
+        save_btn.clicked.connect(self.save_settings)
+        save_btn.setStyleSheet("""
+             QPushButton {
+                background-color: #444; 
+                color: white;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 8px 12px;
+             }
+            QPushButton:hover {
+                background-color: #2a2a2a;
+                border: 2px solid #00cc66;
+             }
+        """)
+        layout.addWidget(save_btn)
+
+
+        vis_btn = QtWidgets.QPushButton("Показати/Заховати")
+        vis_btn.clicked.connect(self.overlay.toggle_active)
+         #  стиль (сірий фон, білий текст, заокруглені кути)
+        vis_btn.setStyleSheet("""
+             QPushButton {
+                background-color: #444; 
+                color: white;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 8px 12px;
+             }
+            QPushButton:hover {
+                background-color: #2a2a2a;
+                border: 2px solid #00cc66;
+             }
+            """)
+        layout.addWidget(vis_btn)
+
+        close_btn = QtWidgets.QPushButton("Закрити")
+        close_btn.clicked.connect(self.close)
+        close_btn.setStyleSheet("""
+             QPushButton {
+                background-color: #444; 
+                color: white;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 8px 12px;
+             }
+            QPushButton:hover {
+                background-color: #2a2a2a;
+                border: 2px solid #f5020f
+             }
+            """)
+        layout.addWidget(close_btn)
+
+        self.setLayout(layout)
+        self.setFixedSize(440, 740)
+
+    def pick_color(self):
+        initial = QtGui.QColor(*self.settings.get('color', (0, 255, 0)))
+        col = QtWidgets.QColorDialog.getColor(initial, self, "Виберіть колір прицілу")
+        if col.isValid():
+            self.settings['color'] = [col.red(), col.green(), col.blue()]
+            self.overlay.update()
+
+    def change_size(self, v):
+        self.settings['size'] = int(v)
+        self.overlay.update()
+
+    def change_gap(self, v):
+        self.settings['gap'] = int(v)
+        self.overlay.update()
+
+    def change_thickness(self, v):
+        self.settings['thickness'] = int(v)
+        self.overlay.update()
+
+    def change_opacity(self, v):
+        self.settings['opacity'] = float(v) / 255.0
+        self.overlay.update()
+
+    def change_style(self, s):
+        self.settings['style'] = s
+        self.overlay.update()
+
+    def toggle_center_dot(self, state):
+        self.settings['center_dot'] = bool(state)
+        self.overlay.update()
+
+    def toggle_hide_center(self, state):
+        self.settings['hide_on_center'] = bool(state)
+        self.overlay.hide_on_center = bool(state)
+        save_settings_to_file(self.settings)
+
+    def toggle_rmb(self, state):
+        self.settings["rmb_toggle"] = bool(state)
+        self.overlay.rmb_toggle_enabled = bool(state)
+        save_settings_to_file(self.settings)
+
+    def save_settings(self):
+        self.settings['size'] = self.size_slider.value()
+        self.settings['gap'] = self.gap_slider.value()
+        self.settings['thickness'] = self.thick_slider.value()
+        self.settings['opacity'] = self.opacity_slider.value() / 100.0
+        self.settings['center_dot'] = self.center_dot_cb.isChecked()
+        
+        self.settings['hotkey'] = self.hotkey_edit.text().strip() or "f12"
+
+        try:
+            keyboard.unhook_all_hotkeys()
+            keyboard.add_hotkey(self.settings['hotkey'], lambda: self.overlay.toggle_active())
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Помилка", f"Не вдалося встановити гарячу клавішу: {e}")
+            return
+
+        save_settings_to_file(self.settings)
+        QtWidgets.QMessageBox.information(self, "Збережено", "Налаштування збережено.")
+
+
+# --- Main ---
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        'color': [0, 255, 0],
+        'size': 30,
+        'gap': 4,
+        'thickness': 3,
+        'opacity': 0.9,
+        'style': 'classic',
+        'center_dot': True,
+        'hotkey': 'f12',
+        'rmb_toggle': False,
+        'hide_on_center': False,
+    }
+
+
+def main():
+    settings = load_settings()
+    app = QtWidgets.QApplication(sys.argv)
+    overlay = OverlayWindow(settings)
+    settings_win = SettingsWindow(overlay, settings)
+    app.setWindowIcon(QtGui.QIcon("ReticleX.ico"))   # тут замінюємо іконку
+    settings_win.move(50, 50)
+    settings_win.show()
+    app.setStyleSheet("""
+    QWidget {
+        background-color: #222;  /* темно-сірий фон */
+        color: white;           /*  білий текст */
+        font-size: 11pt;        /*  розмір шрифту */
+        font-family: Segoe UI;  /*  шрифт */
+    }
+    QPushButton {
+        background-color: #444;
+        border: 1px solid #666;
+        border-radius: 6px;
+        padding: 5px 10px;
+    }
+    QPushButton:hover {
+        background-color: #666;
+    }
+    QPushButton:pressed {
+        background-color: #111;
+    }
+    QComboBox {
+        background-color: #444;
+        border: 1px solid #666;
+        border-radius: 6px;
+        padding: 4px;
+    }
+    QComboBox QAbstractItemView {
+        background-color: #333;
+        selection-background-color: #555;
+    }
+    QSlider::groove:horizontal {
+        border: 1px solid #444;
+        height: 6px;
+        background: #333;
+        margin: 2px 0;
+        border-radius: 3px;
+    }
+    QSlider::handle:horizontal {
+        background: #00ff00;
+        border: 1px solid #222;
+        width: 14px;
+        margin: -4px 0;
+        border-radius: 7px;
+    }
+""")
+
+    try:
+        keyboard.add_hotkey(settings.get('hotkey', 'f12'), lambda: overlay.toggle_active())
+    except Exception as e:
+        print("Не вдалося зареєструвати гарячу клавішу:", e)
+
+    def on_quit():
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+
+    app.aboutToQuit.connect(on_quit)
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
